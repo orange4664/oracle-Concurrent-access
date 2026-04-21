@@ -1,103 +1,190 @@
 # Oracle Concurrent Access
 
-Oracle dispatcher with 3-worker concurrency and request queue.
+让 Oracle (ChatGPT browser automation) 支持多并发。提供两种方案：
 
-## Architecture
+| | 方案一：多标签页 | 方案二：多 Worker + Dispatcher |
+|---|---|---|
+| 内存 | ~550MB（1 个 Chrome） | ~2GB+（3 个 Chrome） |
+| 最低内存 | 1GB | 4GB |
+| 并发方式 | 标签页共享 profile lock（提交串行，等待并行） | 完全独立 |
+| 排队 | Oracle 内置（满了返回 409） | Dispatcher 队列 + NDJSON 进度 |
+| 部署复杂度 | 改 1 个文件 | 4 个 systemd 服务 |
+
+**推荐方案一**，除非你内存充足（4GB+）且需要完全独立的 worker。
+
+---
+
+## 方案一：多标签页（推荐）
+
+单个 Chrome 进程，多个隔离标签页。
 
 ```
-Client → Dispatcher (:3080) → Worker 1 (:3081) → Chrome + ChatGPT
-                             → Worker 2 (:3082) → Chrome + ChatGPT
-                             → Worker 3 (:3083) → Chrome + ChatGPT
-                             → Queue (if all busy)
+Client --POST /runs--> Oracle serve (:3080, --max-concurrent 3)
+                         |-- Tab 1 -> chatgpt.com
+                         |-- Tab 2 -> chatgpt.com
+                         +-- Tab 3 -> chatgpt.com
 ```
 
-- **Dispatcher** sits on port 3080, transparent proxy to Oracle serve workers
-- **3 Workers** each run `oracle serve` with independent Chrome instances
-- **Queue** holds requests when all workers are busy, FIFO, max 20 by default
-- Clients see queue position updates via NDJSON stream
-- Fully compatible with existing Oracle CLI and MCP — no client changes needed
+### 原理
 
-## API
+- 修改 `server.ts`，把 `busy` 布尔值替换为 `activeRuns` 计数器 + `maxConcurrent` 上限
+- 每个请求通过 CDP `connectWithNewTab` 打开隔离标签页
+- Oracle 的 profile lock 只锁提交阶段（输入 + 发送），等待回复阶段并行
+- 修改 `oracle-cli.ts`，新增 `--max-concurrent <number>` 参数
 
-Same as Oracle serve, plus:
-
-| Endpoint | Auth | Description |
-|----------|------|-------------|
-| `GET /status` | No | Liveness check |
-| `GET /queue` | No | Queue & worker status |
-| `GET /health` | Bearer | Authenticated health check |
-| `POST /runs` | Bearer | Submit a run (proxied to worker or queued) |
-
-### Queue behavior
-
-When all workers are busy:
-1. Request enters queue, client receives NDJSON: `{"type":"queue","position":1,...}`
-2. As queue drains, clients receive: `{"type":"queue_update","position":N,...}`
-3. When a worker frees up, the request is proxied and the real NDJSON response streams through
-4. If queue is full (default 20), returns HTTP 503
-5. If queued too long (default 5min), returns timeout
-
-## Deploy
+### 部署
 
 ```bash
-# On the server
+# 1. 安装 oracle
+npm install -g git+https://github.com/orange4664/oracle.git
+
+# 2. 用多标签页版本覆盖 server.js
+git clone https://github.com/orange4664/oracle-Concurrent-access.git
+cp oracle-Concurrent-access/oracle-multi-tab/dist/src/remote/server.js \
+   /usr/lib/node_modules/@steipete/oracle/dist/src/remote/server.js
+
+# 3. Linux 服务器补丁（用 python3，不要用 sed，见 BUGFIX.md）
+python3 << 'PATCH'
+import re
+p = '/usr/lib/node_modules/@steipete/oracle/dist/src/remote/server.js'
+c = open(p).read()
+# 强制 preferManualLogin = true（Linux 上必须）
+c = c.replace(
+    'const preferManualLogin = options.manualLoginDefault || process.platform === "win32" || isWsl();',
+    'const preferManualLogin = true;'
+)
+# Chrome 加 --no-sandbox（root 用户必须）
+c = c.replace(
+    '"--no-first-run",\n                "--no-default-browser-check",',
+    '"--no-first-run",\n                "--no-default-browser-check",\n                "--no-sandbox",'
+)
+# 如果需要代理，取消下面的注释：
+# c = c.replace('"--no-sandbox",', '"--no-sandbox",\n                "--proxy-server=socks5://127.0.0.1:1080",')
+open(p, 'w').write(c)
+print('Patched')
+PATCH
+
+# 4. 准备 cookies
+mkdir -p ~/.oracle/browser-profile
+# 把 cookies.json 放到 ~/.oracle/
+
+# 5. 启动
+oracle serve --port 3080 --token YOUR_TOKEN --max-concurrent 3
+```
+
+### systemd 服务示例
+
+```ini
+[Unit]
+Description=Oracle serve
+After=network.target
+
+[Service]
+ExecStartPre=/bin/rm -f /root/.oracle/browser-profile/DevToolsActivePort
+ExecStart=/usr/bin/oracle serve --port 3080 --token YOUR_TOKEN --max-concurrent 3
+ExecStartPost=/opt/inject-cookies-auto.sh
+Environment=DISPLAY=:99
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Cookie 注入
+
+```bash
+PORT=$(cat ~/.oracle/browser-profile/DevToolsActivePort 2>/dev/null | head -1)
+node scripts/inject-cookies.js "$PORT" ~/.oracle/cookies.json
+```
+
+---
+
+## 方案二：多 Worker + Dispatcher
+
+多个 Chrome 实例，前面放一个负载均衡 dispatcher + 请求队列。
+
+```
+Client -> Dispatcher (:3080) -> Worker 1 (:3081) -> Chrome + ChatGPT
+                              -> Worker 2 (:3082) -> Chrome + ChatGPT
+                              -> Worker 3 (:3083) -> Chrome + ChatGPT
+                              -> Queue (if all busy)
+```
+
+### 部署
+
+```bash
+# 1. 安装 oracle
+npm install -g git+https://github.com/orange4664/oracle.git
+
+# 2. 克隆本仓库
 git clone https://github.com/orange4664/oracle-Concurrent-access.git /opt/oracle-concurrent
 cd /opt/oracle-concurrent
 
-# Set your token (or edit setup.sh)
+# 3. 设置 token
 export ORACLE_TOKEN=your-token-here
 
-# Run setup (creates systemd services, copies profiles, starts everything)
+# 4. 运行 setup（创建 3 个 worker 目录 + 4 个 systemd 服务）
 bash scripts/setup.sh
 ```
 
-### Prerequisites
+### 前置条件
 
-- Oracle CLI installed: `npm install -g git+https://github.com/orange4664/oracle.git`
-- Xvfb running (for headed Chrome)
-- SOCKS proxy if needed
-- Browser profile with ChatGPT cookies at `/root/.oracle/`
+- Oracle CLI 已安装
+- Xvfb 运行中（headed Chrome 需要）
+- 如需代理则配置 SOCKS proxy
+- ChatGPT cookies 在 `/root/.oracle/cookies.json`
 
-### Re-inject cookies
-
-After cookies expire or are updated:
+### Cookie 更新
 
 ```bash
-# Copy new cookies to all workers
 for i in 1 2 3; do
   cp /root/.oracle/cookies.json /opt/oracle-worker-$i/.oracle/cookies.json
 done
-
-# Inject into running Chrome instances
 bash /opt/oracle-concurrent/scripts/inject-all.sh
 ```
 
-### Service management
+### 服务管理
 
 ```bash
-# Check status
 systemctl status oracle-dispatcher oracle-worker-{1,2,3}
-
-# Restart all
 systemctl restart oracle-worker-{1,2,3} oracle-dispatcher
-
-# View logs
 journalctl -u oracle-dispatcher -f
-journalctl -u oracle-worker-1 -f
 ```
 
-## Config
+### Dispatcher API
 
-Environment variables for the dispatcher:
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `GET /status` | No | 存活检查 |
+| `GET /queue` | No | 队列和 worker 状态 |
+| `GET /health` | Bearer | 认证健康检查 |
+| `POST /runs` | Bearer | 提交请求（代理到 worker 或排队） |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DISPATCH_PORT` | 3080 | Dispatcher listen port |
-| `WORKER_PORTS` | 3081,3082,3083 | Comma-separated worker ports |
-| `ORACLE_TOKEN` | (empty) | Bearer token for auth |
-| `MAX_QUEUE` | 20 | Max queued requests |
-| `WORKER_TIMEOUT` | 180000 | Per-request timeout (ms) |
-| `QUEUE_TIMEOUT` | 300000 | Max time in queue (ms) |
+### 排队机制
+
+1. 所有 worker 忙 -> 进入队列，客户端收到 NDJSON: `{"type":"queue","position":1,...}`
+2. 队列推进 -> 客户端收到: `{"type":"queue_update","position":N,...}`
+3. worker 空闲 -> 请求被代理，NDJSON 响应直接透传
+4. 队列满（默认 20）-> HTTP 503
+5. 排队超时（默认 5 分钟）-> 超时错误
+
+### Dispatcher 配置
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DISPATCH_PORT` | 3080 | Dispatcher 端口 |
+| `WORKER_PORTS` | 3081,3082,3083 | Worker 端口列表 |
+| `ORACLE_TOKEN` | (空) | Bearer token |
+| `MAX_QUEUE` | 20 | 最大排队数 |
+| `WORKER_TIMEOUT` | 180000 | 单请求超时 (ms) |
+| `QUEUE_TIMEOUT` | 300000 | 排队超时 (ms) |
+
+---
+
+## 踩坑记录
+
+部署过程中遇到的所有坑和修复方法见 [BUGFIX.md](BUGFIX.md)。
 
 ## License
 
