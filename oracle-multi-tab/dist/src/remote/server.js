@@ -41,6 +41,19 @@ export async function createRemoteServer(options = {}, deps = {}) {
     // Concurrency guard: limit how many browser tabs can run simultaneously.
     const maxConcurrent = options.maxConcurrent ?? 1;
     let activeRuns = 0;
+    const maxQueue = 25;
+    const queue = [];
+    function drainQueue() {
+        while (queue.length > 0 && activeRuns < maxConcurrent) {
+            const next = queue.shift();
+            queue.forEach((item, i) => {
+                if (!item.res.writableEnded) {
+                    item.res.write(JSON.stringify({ type: "queue_update", position: i + 1, total: queue.length }) + "\n");
+                }
+            });
+            next.resolve();
+        }
+    }
     if (!process.listenerCount("unhandledRejection")) {
         process.on("unhandledRejection", (reason) => {
             logger(`Unhandled promise rejection in remote server: ${reason instanceof Error ? reason.message : String(reason)}`);
@@ -85,13 +98,37 @@ export async function createRemoteServer(options = {}, deps = {}) {
             res.end(JSON.stringify({ error: "unauthorized" }));
             return;
         }
+        let queued = false;
         if (activeRuns >= maxConcurrent) {
-            if (verbose) {
-                logger(`[serve] Busy: rejecting new run from ${formatSocket(req)} (${activeRuns}/${maxConcurrent} slots used)`);
+            if (queue.length >= maxQueue) {
+                logger(`[serve] Queue full: rejecting from ${formatSocket(req)} (${queue.length}/${maxQueue})`);
+                res.writeHead(503, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "queue_full", message: `All ${maxConcurrent} slots busy, queue full (${maxQueue}).`, queueLength: queue.length }));
+                return;
             }
-            res.writeHead(409, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "busy", activeRuns, maxConcurrent }));
-            return;
+            res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+            const position = queue.length + 1;
+            logger(`[serve] Queued request from ${formatSocket(req)} at position ${position}`);
+            res.write(JSON.stringify({ type: "queue", position, totalSlots: maxConcurrent, message: `排队中，前方 ${position - 1} 人，共 ${maxConcurrent} 个并发槽位。` }) + "\n");
+            queued = true;
+            await new Promise((resolve) => {
+                const item = { resolve, res };
+                queue.push(item);
+                res.on("close", () => {
+                    const idx = queue.indexOf(item);
+                    if (idx !== -1) {
+                        queue.splice(idx, 1);
+                        logger(`[serve] Queued client disconnected, removed from queue`);
+                        queue.forEach((q, i) => {
+                            if (!q.res.writableEnded) {
+                                q.res.write(JSON.stringify({ type: "queue_update", position: i + 1, total: queue.length }) + "\n");
+                            }
+                        });
+                    }
+                });
+            });
+            if (res.writableEnded) return;
+            res.write(JSON.stringify({ type: "queue_done", message: "轮到你了，正在处理..." }) + "\n");
         }
         activeRuns += 1;
         const runStartedAt = Date.now();
@@ -109,7 +146,7 @@ export async function createRemoteServer(options = {}, deps = {}) {
             res.end(JSON.stringify({ error: "invalid_request" }));
             return;
         }
-        res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+        if (!queued) { res.writeHead(200, { "Content-Type": "application/x-ndjson" }); }
         const runId = randomUUID();
         logger(`[serve] Accepted run ${runId} from ${formatSocket(req)} (prompt ${payload?.prompt?.length ?? 0} chars)`);
         // Each run gets an isolated temp dir so attachments/logs don't collide.
@@ -175,7 +212,8 @@ export async function createRemoteServer(options = {}, deps = {}) {
         }
         finally {
             activeRuns -= 1;
-            res.end();
+            if (!res.writableEnded) res.end();
+            drainQueue();
             try {
                 await rm(runDir, { recursive: true, force: true });
             }
