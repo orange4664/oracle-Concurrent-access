@@ -37,7 +37,8 @@ function queueInfo() {
 }
 
 // Stream-proxy a request to a worker (NDJSON passthrough)
-function proxyStream(worker, method, url, headers, body, clientRes) {
+// headersSent=true means this was a queued job that already wrote headers + queue messages
+function proxyStream(worker, method, url, headers, body, clientRes, headersSent) {
   return new Promise((resolve, reject) => {
     const opts = {
       hostname: '127.0.0.1',
@@ -49,9 +50,28 @@ function proxyStream(worker, method, url, headers, body, clientRes) {
     };
 
     const proxyReq = http.request(opts, proxyRes => {
-      clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(clientRes);
-      proxyRes.on('end', resolve);
+      if (headersSent) {
+        // Headers already sent (queued job). Both are NDJSON, so just pipe body.
+        // If worker returned non-200 (e.g. 409 busy), send as an error event.
+        if (proxyRes.statusCode !== 200) {
+          const chunks = [];
+          proxyRes.on('data', c => chunks.push(c));
+          proxyRes.on('end', () => {
+            const body = Buffer.concat(chunks).toString();
+            clientRes.write(JSON.stringify({ type: 'error', message: body }) + '\n');
+            clientRes.end();
+            resolve();
+          });
+        } else {
+          proxyRes.pipe(clientRes);
+          proxyRes.on('end', resolve);
+        }
+      } else {
+        // Fresh request, forward headers as-is
+        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(clientRes);
+        proxyRes.on('end', resolve);
+      }
       proxyRes.on('error', reject);
     });
 
@@ -71,13 +91,18 @@ async function handleJob(worker, job) {
   log(`[#${job.id}] → worker :${worker.port}`);
 
   try {
-    await proxyStream(worker, job.method, job.url, job.headers, job.body, job.res);
+    await proxyStream(worker, job.method, job.url, job.headers, job.body, job.res, job.headersSent);
     log(`[#${job.id}] done (worker :${worker.port}, ${Date.now() - job.timestamp}ms)`);
   } catch (err) {
     log(`[#${job.id}] error (worker :${worker.port}): ${err.message}`);
     if (!job.res.writableEnded) {
-      job.res.writeHead(502, { 'Content-Type': 'application/json' });
-      job.res.end(JSON.stringify({ error: 'worker_error', message: err.message }));
+      if (job.headersSent) {
+        job.res.write(JSON.stringify({ type: 'error', message: err.message }) + '\n');
+        job.res.end();
+      } else {
+        job.res.writeHead(502, { 'Content-Type': 'application/json' });
+        job.res.end(JSON.stringify({ error: 'worker_error', message: err.message }));
+      }
     }
   } finally {
     worker.busy = false;
