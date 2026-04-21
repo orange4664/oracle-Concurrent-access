@@ -1,14 +1,14 @@
 # Oracle Concurrent Access
 
-让 Oracle (ChatGPT browser automation) 支持多并发。提供两种方案：
+让 Oracle (ChatGPT browser automation) 支持多并发。提供两种方案，均为本仓库的修改，非 Oracle 内置功能。
 
 | | 方案一：多标签页 | 方案二：多 Worker + Dispatcher |
 |---|---|---|
 | 内存 | ~550MB（1 个 Chrome） | ~2GB+（3 个 Chrome） |
 | 最低内存 | 1GB | 4GB |
 | 并发方式 | 标签页共享 profile lock（提交串行，等待并行） | 完全独立 |
-| 排队 | Oracle 内置（满了返回 409） | Dispatcher 队列 + NDJSON 进度 |
-| 部署复杂度 | 改 1 个文件 | 4 个 systemd 服务 |
+| 排队 | 内置队列，最多 25 人，NDJSON 进度更新 | Dispatcher 队列，最多 20 人，NDJSON 进度更新 |
+| 部署复杂度 | 覆盖 1 个文件 + 打补丁 | 4 个 systemd 服务 |
 
 **推荐方案一**，除非你内存充足（4GB+）且需要完全独立的 worker。
 
@@ -16,21 +16,35 @@
 
 ## 方案一：多标签页（推荐）
 
-单个 Chrome 进程，多个隔离标签页。
+单个 Chrome 进程，多个隔离标签页，内置排队。
 
 ```
 Client --POST /runs--> Oracle serve (:3080, --max-concurrent 3)
                          |-- Tab 1 -> chatgpt.com
                          |-- Tab 2 -> chatgpt.com
                          +-- Tab 3 -> chatgpt.com
+                         +-- Queue (max 25, FIFO)
 ```
 
 ### 原理
 
-- 修改 `server.ts`，把 `busy` 布尔值替换为 `activeRuns` 计数器 + `maxConcurrent` 上限
+修改 Oracle 的 `server.ts` 和 `oracle-cli.ts`（非内置功能，需覆盖编译文件部署）：
+
+- `busy` 布尔值替换为 `activeRuns` 计数器 + `maxConcurrent` 上限
+- 新增 `--max-concurrent <number>` CLI 参数
 - 每个请求通过 CDP `connectWithNewTab` 打开隔离标签页
-- Oracle 的 profile lock 只锁提交阶段（输入 + 发送），等待回复阶段并行
-- 修改 `oracle-cli.ts`，新增 `--max-concurrent <number>` 参数
+- Profile lock 只锁提交阶段（输入 + 发送），等待回复阶段并行
+- 满并发时进入 FIFO 队列（最多 25），客户端收到 NDJSON 排队进度
+- 队列满时返回 503 `queue_full`
+
+### 排队机制
+
+| NDJSON 事件 | 含义 |
+|-------------|------|
+| `{"type":"queue","position":1,"totalSlots":3}` | 进入队列，显示排队位置 |
+| `{"type":"queue_update","position":N,"total":M}` | 队列推进，位置更新 |
+| `{"type":"queue_done"}` | 轮到你了，开始处理 |
+| HTTP 503 `queue_full` | 队列已满（25），请稍后重试 |
 
 ### 部署
 
@@ -38,14 +52,13 @@ Client --POST /runs--> Oracle serve (:3080, --max-concurrent 3)
 # 1. 安装 oracle
 npm install -g git+https://github.com/orange4664/oracle.git
 
-# 2. 用多标签页版本覆盖 server.js
+# 2. 用修改版 server.js 覆盖安装的版本
 git clone https://github.com/orange4664/oracle-Concurrent-access.git
 cp oracle-Concurrent-access/oracle-multi-tab/dist/src/remote/server.js \
    /usr/lib/node_modules/@steipete/oracle/dist/src/remote/server.js
 
 # 3. Linux 服务器补丁（用 python3，不要用 sed，见 BUGFIX.md）
 python3 << 'PATCH'
-import re
 p = '/usr/lib/node_modules/@steipete/oracle/dist/src/remote/server.js'
 c = open(p).read()
 # 强制 preferManualLogin = true（Linux 上必须）
@@ -68,7 +81,7 @@ PATCH
 mkdir -p ~/.oracle/browser-profile
 # 把 cookies.json 放到 ~/.oracle/
 
-# 5. 启动
+# 5. 启动（3 并发，排队最多 25）
 oracle serve --port 3080 --token YOUR_TOKEN --max-concurrent 3
 ```
 
@@ -102,14 +115,16 @@ node scripts/inject-cookies.js "$PORT" ~/.oracle/cookies.json
 
 ## 方案二：多 Worker + Dispatcher
 
-多个 Chrome 实例，前面放一个负载均衡 dispatcher + 请求队列。
+多个 Chrome 实例，前面放一个负载均衡 dispatcher + 请求队列。同样是本仓库自行实现，非 Oracle 内置。
 
 ```
 Client -> Dispatcher (:3080) -> Worker 1 (:3081) -> Chrome + ChatGPT
                               -> Worker 2 (:3082) -> Chrome + ChatGPT
                               -> Worker 3 (:3083) -> Chrome + ChatGPT
-                              -> Queue (if all busy)
+                              -> Queue (max 20, FIFO)
 ```
+
+> **Warning:** 每个 Chrome 实例 ~600-800MB 内存，至少需要 4GB RAM。
 
 ### 部署
 
