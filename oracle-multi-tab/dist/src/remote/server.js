@@ -138,7 +138,7 @@ export async function createRemoteServer(options = {}, deps = {}) {
                     sendEvent({ type: "log", message });
                 }
             });
-            automationLogger.verbose = Boolean(payload.options.verbose);
+            automationLogger.verbose = Boolean(payload.options?.verbose);
             // Remote runs always rely on the host's own Chrome profile; ignore any inline cookie transfer.
             if (payload.browserConfig) {
                 payload.browserConfig.inlineCookies = null;
@@ -162,8 +162,8 @@ export async function createRemoteServer(options = {}, deps = {}) {
                 attachments,
                 config: payload.browserConfig,
                 log: automationLogger,
-                heartbeatIntervalMs: payload.options.heartbeatIntervalMs,
-                verbose: payload.options.verbose,
+                heartbeatIntervalMs: payload.options?.heartbeatIntervalMs,
+                verbose: payload.options?.verbose,
             });
             sendEvent({ type: "result", result: sanitizeResult(result) });
             logger(`[serve] Run ${runId} completed in ${Date.now() - runStartedAt}ms`);
